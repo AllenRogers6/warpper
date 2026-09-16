@@ -1,0 +1,7 @@
+__pycache__/
+.venv
+certs
+data
+.eggs/
+*.egg-info/
+*.egg
