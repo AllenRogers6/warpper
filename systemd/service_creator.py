@@ -1,6 +1,6 @@
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 SERVICE_NAME = "warpper.service"
 SERVICE_PATH = Path("/etc/systemd/system") / SERVICE_NAME
@@ -32,11 +32,10 @@ WantedBy=multi-user.target
 
 
 def install_service():
-    if hasattr(__import__("os"), "geteuid"):
-        if __import__("os").geteuid() != 0:
-            print("Run this installer as root:")
-            print(f"sudo {sys.executable} {SCRIPT_PATH}")
-            sys.exit(1)
+    if hasattr(__import__("os"), "geteuid") and __import__("os").geteuid() != 0:
+        print("Run this installer as root:")
+        print(f"sudo {sys.executable} {SCRIPT_PATH}")
+        sys.exit(1)
 
     SERVICE_PATH.write_text(UNIT)
 

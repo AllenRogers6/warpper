@@ -1,5 +1,4 @@
 import sqlite3
-import os
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS categories (

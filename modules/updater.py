@@ -1,6 +1,10 @@
-import urllib.request
 import logging
+import urllib.error
+import urllib.request
+
 from modules.database import get_connection
+
+logger = logging.getLogger(__name__)
 
 BLOCKLIST_URLS = {
     "ads": [
@@ -34,13 +38,13 @@ def download_blocklist(url):
                 domain = domain.strip()
                 if domain and not domain.startswith("#"):
                     yield domain
-    except Exception as e:
-        logging.error(f"Failed to download {url}: {e}")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        logger.error(f"Failed to download {url}: {e}")
 
 
 def update_blocklists(db_path):
     conn = get_connection(db_path)
-    for category in BLOCKLIST_URLS.keys():
+    for category in BLOCKLIST_URLS:
         cat_id = conn.execute(
             "SELECT id FROM categories WHERE name=?", (category,)
         ).fetchone()
@@ -64,4 +68,4 @@ def update_blocklists(db_path):
                 )
     conn.commit()
     conn.close()
-    logging.info("Blocklists updated.")
+    logger.info("Blocklists updated.")

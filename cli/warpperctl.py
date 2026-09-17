@@ -42,7 +42,7 @@ def parse_days(raw):
     out = []
     for tok in raw.replace(" ", "").split(","):
         key = tok.lower()
-        if key in DAY_ALIASES and DAY_ALIASES[key]:
+        if DAY_ALIASES.get(key):
             out.append(DAY_ALIASES[key])
         else:
             out.append(str(int(tok)))

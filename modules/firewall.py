@@ -1,15 +1,16 @@
-import subprocess
 import socket
-import logging
+import subprocess
+
 from modules.rule_engine import RuleEngine
 
 
 class FirewallManager:
-    def __init__(self, db_path, nft_table, block_set):
+    def __init__(self, db_path, nft_table, block_set, logger):
         self.rule_engine = RuleEngine(db_path)
         self.table = nft_table
         self.set = block_set
         self.set_name = f"{nft_table} {block_set}"
+        self.logger = logger
 
     def setup_nftables(self):
         commands = [
@@ -23,7 +24,7 @@ class FirewallManager:
                 subprocess.run(["nft", *cmd.split()], check=True, capture_output=True)
             except subprocess.CalledProcessError as e:
                 if b"File exists" not in e.stderr:
-                    logging.error(f"nftables setup error: {e.stderr.decode()}")
+                    self.logger.error(f"nftables setup error: {e.stderr.decode()}")
 
     def update_blocked_ips(self):
         conn = self.rule_engine.db_conn
@@ -47,4 +48,4 @@ class FirewallManager:
                 ["nft", "add", "element", self.table, self.set, "{", ip, "}"],
                 check=True,
             )
-        logging.info(f"Updated firewall block set with {len(ips)} IPs.")
+        self.logger.info(f"Updated firewall block set with {len(ips)} IPs.")

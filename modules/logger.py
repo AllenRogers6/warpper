@@ -1,5 +1,5 @@
 import logging
-import sqlite3
+
 from modules.database import get_connection
 
 

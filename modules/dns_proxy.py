@@ -1,8 +1,9 @@
 import asyncio
 import socket
+import struct
 
 import psutil
-from dnslib import DNSRecord, QTYPE, RR, A, AAAA
+from dnslib import QTYPE, RR, A, DNSError, DNSRecord
 
 
 def get_port_holders(port: int):
@@ -184,7 +185,7 @@ class DNSProxy:
                     )
                 finally:
                     transport.close()
-            except Exception as e:
+            except (OSError, TimeoutError) as e:
                 last_exc = e
                 self.logger.warning(f"upstream {upstream[0]}:{upstream[1]} failed: {e}")
                 continue
@@ -196,12 +197,10 @@ class DNSProxy:
 def _extract_ips(response_bytes):
     try:
         response = DNSRecord.parse(response_bytes)
-    except Exception:
+    except (DNSError, struct.error, IndexError):
         return []
     ips = []
     for rr in response.rr:
-        if rr.rtype == QTYPE.A:
-            ips.append(str(rr.rdata))
-        elif rr.rtype == QTYPE.AAAA:
+        if rr.rtype == QTYPE.A or rr.rtype == QTYPE.AAAA:
             ips.append(str(rr.rdata))
     return ips

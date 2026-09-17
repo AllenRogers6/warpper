@@ -1,6 +1,7 @@
-import re
 import fnmatch
-from datetime import datetime
+import re
+from datetime import UTC, datetime
+
 from modules.database import get_connection
 
 
@@ -20,7 +21,7 @@ def domain_matches(domain, pattern, rule_type):
 def is_rule_active(rule, now=None):
     if not rule["enabled"]:
         return False
-    now = now or datetime.now()
+    now = now or datetime.now(UTC)
     days = rule["days_of_week"]
     if days:
         allowed_days = [int(d) for d in days.split(",") if d.strip()]

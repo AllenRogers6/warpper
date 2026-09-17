@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from modules.cert import generate_ca
-from modules.config import load_config, get_db_path
+from modules.config import get_db_path, load_config
 from modules.control import ControlHandlers
 from modules.database import init_db
 from modules.dns_proxy import DNSProxy

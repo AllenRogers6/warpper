@@ -1,4 +1,5 @@
 import sqlite3
+
 from modules.database import get_connection
 from modules.ipc import ControlError
 

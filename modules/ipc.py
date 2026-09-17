@@ -1,9 +1,8 @@
-# modules/ipc.py
 import asyncio
 import json
-import logging
 import os
 import socket
+import struct
 from pathlib import Path
 
 PROTOCOL_VERSION = 1
@@ -29,7 +28,7 @@ class ControlServer:
         self,
         path: Path,
         handlers: dict,
-        logger: logging.Logger,
+        logger,
         group: str | None = None,
     ):
         self.path = Path(path)
@@ -74,14 +73,14 @@ class ControlServer:
         try:
             self.path.unlink()
         except FileNotFoundError:
-            pass
+            self.logger.warning(f"cannot remove stale socket {self.path}")
 
     async def _handle_client(self, reader, writer):
         peer_pid = None
         try:
             peer_pid = self._peer_credentials(writer)
-        except Exception:
-            pass
+        except (OSError, struct.error, AttributeError):
+            self.logger.warning("cannot determine peer credentials")
 
         try:
             while True:
@@ -96,7 +95,7 @@ class ControlServer:
 
                 if req.get("v") != PROTOCOL_VERSION:
                     await self._reply(
-                        writer, ok=False, error=f"unsupported protocol version"
+                        writer, ok=False, error="unsupported protocol version"
                     )
                     continue
 
@@ -118,13 +117,13 @@ class ControlServer:
                     self.logger.exception(f"handler {cmd} failed (peer pid={peer_pid})")
                     await self._reply(writer, ok=False, error=str(e))
         except (ConnectionResetError, BrokenPipeError):
-            pass
+            self.logger.warning("connection reset by peer")
         finally:
             try:
                 writer.close()
                 await writer.wait_closed()
-            except Exception:
-                pass
+            except (OSError, ConnectionError):
+                self.logger.warning("cannot close connection")
 
     @staticmethod
     def _peer_credentials(writer) -> int | None:
@@ -137,7 +136,7 @@ class ControlServer:
             creds = sock.getsockopt(
                 socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
             )
-            pid, uid, gid = struct.unpack("3i", creds)
+            pid, _, _ = struct.unpack("3i", creds)
             return pid
         except (OSError, AttributeError):
             return None
