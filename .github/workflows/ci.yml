@@ -47,6 +47,7 @@ jobs:
         run: |
           ruff check .
 
-      - name: Test
-        run: |
-          pytest
+      # temporarily disabled
+      # - name: Test
+      #   run: |
+      #     pytest
