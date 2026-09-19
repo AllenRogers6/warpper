@@ -7,6 +7,7 @@ class QueryLogger:
     def __init__(self, db_path, name="dnsproxy", level=logging.INFO):
         self.db_path = db_path
         self._log = logging.getLogger(name)
+        self._log.propagate = False
         if not self._log.handlers:
             handler = logging.StreamHandler()
             handler.setFormatter(
