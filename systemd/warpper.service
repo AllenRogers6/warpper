@@ -1,0 +1,21 @@
+[Unit]
+Description=Warpper daemon
+After=network-online.target
+Before=nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/var/lib/warpper
+StateDirectory=warpper
+ExecStart=/usr/bin/warpperd
+Restart=on-failure
+RestartSec=3
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

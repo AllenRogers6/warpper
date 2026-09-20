@@ -1,0 +1,10 @@
+[Unit]
+Description=Update Warpper blocklists
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/warpperctl update
+SuccessExitStatus=0

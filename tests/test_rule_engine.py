@@ -1,8 +1,8 @@
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 
 import pytest
 
-from modules.rule_engine import RuleEngine, _parse_days, domain_matches
+from modules.rule_engine import _parse_days, domain_matches
 
 
 @pytest.mark.parametrize(
@@ -39,7 +39,6 @@ def test_parse_days(raw, expected):
 
 
 def _add_rule(engine, pattern, mtype, action, **kwargs):
-    import sqlite3
     from modules.database import get_connection
 
     conn = get_connection(engine.db_path)
@@ -91,7 +90,6 @@ def test_whitelist_beats_block(rule_engine):
 
 
 def test_disabled_rule_is_ignored(rule_engine):
-    import sqlite3
     from modules.database import get_connection
 
     conn = get_connection(rule_engine.db_path)
@@ -117,8 +115,161 @@ def test_time_window_excludes_off_hours(rule_engine):
     )
     from modules.rule_engine import is_rule_active
 
-    rule = rule_engine.rules_cache[0]
+    rule = rule_engine._exact["reddit.com"]
     at_10am = datetime(2026, 1, 5, 10, 0, tzinfo=UTC)
     at_8pm = datetime(2026, 1, 5, 20, 0, tzinfo=UTC)
     assert is_rule_active(rule, at_10am)
     assert not is_rule_active(rule, at_8pm)
+
+
+def test_add_rule_appends_to_cache(rule_engine):
+    from modules.database import get_connection
+
+    conn = get_connection(rule_engine.db_path)
+    cur = conn.execute(
+        "INSERT INTO rules (pattern, type, action, enabled) "
+        "VALUES (?, 'exact', 'block', 1)",
+        ("foo.example",),
+    )
+    conn.commit()
+    rule_id = cur.lastrowid
+    conn.close()
+
+    before = rule_engine.rule_count
+    rule_engine.add_rule(rule_id)
+    assert rule_engine.rule_count == before + 1
+    assert "foo.example" in rule_engine._exact
+    assert rule_engine._exact["foo.example"]["action"] == "block"
+
+
+def test_add_rule_skips_disabled(rule_engine):
+    from modules.database import get_connection
+
+    conn = get_connection(rule_engine.db_path)
+    cur = conn.execute(
+        "INSERT INTO rules (pattern, type, action, enabled) "
+        "VALUES (?, 'exact', 'block', 0)",
+        ("disabled.example",),
+    )
+    conn.commit()
+    rule_id = cur.lastrowid
+    conn.close()
+
+    before = rule_engine.rule_count
+    rule_engine.add_rule(rule_id)
+    assert rule_engine.rule_count == before
+    assert "disabled.example" not in rule_engine._exact
+
+
+def test_remove_rules_by_pattern(rule_engine):
+    from modules.database import get_connection
+
+    conn = get_connection(rule_engine.db_path)
+    conn.execute(
+        "INSERT INTO rules (pattern, type, action, enabled) "
+        "VALUES ('foo.example', 'exact', 'block', 1)"
+    )
+    conn.execute(
+        "INSERT INTO rules (pattern, type, action, enabled) "
+        "VALUES ('foo.example', 'wildcard', 'block', 1)"
+    )
+    conn.execute(
+        "INSERT INTO rules (pattern, type, action, enabled) "
+        "VALUES ('bar.example', 'exact', 'block', 1)"
+    )
+    conn.commit()
+    conn.close()
+    rule_engine.reload_rules()
+
+    removed = rule_engine.remove_rules_by_pattern("foo.example")
+    assert removed == 2
+    assert "foo.example" not in rule_engine._exact
+    assert all(r["pattern"] != "foo.example" for r in rule_engine._wildcard)
+    assert "bar.example" in rule_engine._exact
+
+
+def test_set_category_enabled(rule_engine):
+    from modules.database import get_connection
+
+    conn = get_connection(rule_engine.db_path)
+    cat_id = conn.execute("INSERT INTO categories (name) VALUES ('test')").lastrowid
+    for p in ("a.example", "b.example", "c.example"):
+        conn.execute(
+            "INSERT INTO rules (pattern, type, action, category_id, enabled) "
+            "VALUES (?, 'exact', 'block', ?, 1)",
+            (p, cat_id),
+        )
+    conn.commit()
+    conn.close()
+    rule_engine.reload_rules()
+
+    updated = rule_engine.set_category_enabled(cat_id, enabled=False)
+    assert updated == 3
+    for r in rule_engine.all_rules():
+        assert r.get("category_id") != cat_id
+
+
+def test_exact_lookup_is_o1(rule_engine):
+    import time
+
+    from modules.database import get_connection
+
+    conn = get_connection(rule_engine.db_path)
+    for i in range(10000):
+        conn.execute(
+            "INSERT INTO rules (pattern, type, action, enabled) "
+            "VALUES (?, 'exact', 'block', 1)",
+            (f"domain{i}.example",),
+        )
+    conn.commit()
+    conn.close()
+    rule_engine.reload_rules()
+
+    start = time.perf_counter()
+    for i in range(1000):
+        rule_engine.evaluate(f"domain{i * 10}.example")
+    elapsed = time.perf_counter() - start
+    assert elapsed < 0.5, f"1000 lookups took {elapsed:.3f}s"
+
+
+def test_wildcard_and_regex_still_work(rule_engine):
+    from modules.database import get_connection
+
+    conn = get_connection(rule_engine.db_path)
+    conn.execute(
+        "INSERT INTO rules (pattern, type, action, enabled) "
+        "VALUES (?, 'wildcard', 'block', 1)",
+        ("*.doubleclick.net",),
+    )
+    conn.execute(
+        "INSERT INTO rules (pattern, type, action, enabled) "
+        "VALUES (?, 'regex', 'block', 1)",
+        (r"^ads\d+\.example$",),
+    )
+    conn.commit()
+    conn.close()
+    rule_engine.reload_rules()
+
+    assert rule_engine.evaluate("foo.doubleclick.net")[0] == "block"
+    assert rule_engine.evaluate("ads7.example")[0] == "block"
+    assert rule_engine.evaluate("adsx.example")[0] == "allow"
+
+
+def test_disabled_rules_dropped_from_cache(rule_engine):
+    from modules.database import get_connection
+
+    conn = get_connection(rule_engine.db_path)
+    cat_id = conn.execute("INSERT INTO categories (name) VALUES ('temp')").lastrowid
+    for i in range(100):
+        conn.execute(
+            "INSERT INTO rules (pattern, type, action, category_id, enabled) "
+            "VALUES (?, 'exact', 'block', ?, 1)",
+            (f"x{i}.example", cat_id),
+        )
+    conn.commit()
+    conn.close()
+    rule_engine.reload_rules()
+
+    removed = rule_engine.set_category_enabled(cat_id, enabled=False)
+    assert removed == 100
+    assert rule_engine.evaluate("x0.example")[0] == "allow"

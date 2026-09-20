@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -32,6 +33,12 @@ def infer_type(pattern: str) -> tuple[str, str]:
     if any(c in pattern for c in "*?["):
         return pattern, "wildcard"
     return pattern, "exact"
+
+
+def check_root(program: str) -> None:
+    if os.geteuid() != 0:
+        print(f"{program} must be run as root", file=sys.stderr)
+        raise SystemExit(1)
 
 
 def parse_days(raw):
@@ -136,6 +143,142 @@ def cmd_ping(args, client):
     print(json.dumps(client.call("ping"), indent=2))
 
 
+def cmd_firewall(args, client):
+    if args.action == "status":
+        r = client.call("firewall_status")
+        if not r["available"]:
+            print("firewall: unavailable (module not loaded)")
+            return
+        state = "enable" if r["enabled"] else "disable"
+        applied = "yes" if r["applied"] else "no"
+        print(f"firewall: {state}")
+        print(f"  table:     {r['table']}")
+        print(f"  block set: {r['block_set']}")
+        print(f"  applied:   {applied}")
+        return
+
+    if args.action == "enable":
+        r = client.call("firewall_enable")
+        print("firewall enabled" if r["changed"] else "firewall already enabled")
+    elif args.action == "disable":
+        r = client.call("firewall_disable")
+        print("firewall disabled" if r["changed"] else "firewall already disabled")
+    else:
+        raise SystemExit(f"unknown action: {args.action}")
+
+
+def cmd_categories(args, client):
+    if args.action == "list":
+        r = client.call("categories_list")
+        rows = r["categories"]
+        if not rows:
+            print("(no categories)")
+            return
+        print(f"{'Name':<12} {'Active':>8} {'Total':>8}")
+        for c in rows:
+            active = c["active"] or 0
+            total = c["total"] or 0
+            mark = "" if active else "  (disabled)"
+            print(f"{c['name']:<12} {active:>8} {total:>8}{mark}")
+        return
+
+    if args.action == "enable":
+        r = client.call("categories_enable", name=args.name)
+        print(f"enabled {r['category']}: {r['rules_updated']} rule(s) re-enabled")
+    elif args.action == "disable":
+        r = client.call("categories_disable", name=args.name)
+        print(f"disabled {r['category']}: {r['rules_updated']} rule(s) disabled")
+    else:
+        raise SystemExit(f"unknown action: {args.action}")
+
+
+def cmd_update(args, client):
+    cats = args.categories.split(",") if args.categories else None
+    r = client.call("update", timeout=300, categories=cats)
+    for cat, n in r["updated"].items():
+        print(f"  {cat}: {n} domains")
+    print(f"total rules: {r['total_rules']}")
+
+
+def cmd_status(args, client):
+    r = client.call("status")
+
+    def human_size(n):
+        for unit in ("B", "KB", "MB", "GB"):
+            if n < 1024:
+                return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+            n /= 1024
+        return f"{n:.1f} TB"
+
+    def human_uptime(seconds):
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h}h {m}m"
+        if m:
+            return f"{m}m {s}s"
+        return f"{s}s"
+
+    fw = r["firewall"]
+    fw_line = (
+        f"enabled ({fw['table']}, {fw['blocked_ips']} IPs in block set)"
+        if fw["enabled"]
+        else "disabled"
+    )
+
+    print(
+        f"daemon:    running (pid {r['pid']}, up {human_uptime(r['uptime_seconds'])})"
+    )
+    print(f"config:    {r['config_path']}")
+    print(
+        f"db:        {r['db_path']} "
+        f"({human_size(r['db_size_bytes'])}, {r['query_count']:,} queries)"
+    )
+    print(f"rules:     {r['rules_active']:,} active")
+    print(f"whitelist: {r['whitelist_count']:,}")
+    print(f"firewall:  {fw_line}")
+    print(f"upstreams: {', '.join(s.strip() for s in r['upstreams'])}")
+    print(f"listen:    {r['listen']}")
+
+    cache = r.get("cache")
+    if cache:
+        hit_pct = cache["hit_rate"] * 100
+        print(
+            f"cache:     {cache['size']}/{cache['max_size']} entries, "
+            f"{hit_pct:.1f}% hit rate "
+            f"({cache['hits']:,} hits, {cache['misses']:,} misses)"
+        )
+
+
+def cmd_flush_cache(args, client):
+    client.call("flush_cache")
+    print("cache cleared")
+
+
+def cmd_logs(args, client):
+    r = client.call(
+        "logs",
+        tail=args.tail,
+        domain=args.domain,
+        since=args.since,
+        action=args.action,
+    )
+    entries = r["entries"]
+    if not entries:
+        print("(no matching entries)")
+        return
+
+    entries = list(reversed(entries))
+
+    for e in entries:
+        ts = e["timestamp"]
+        client_ip = e["client"] or "?"
+        domain = (e["domain"] or "?")[:32]
+        action = e["action"] or "?"
+        rule = f"  (rule {e['rule_id']})" if e.get("rule_id") else ""
+        print(f"{ts}  {client_ip:<15}  {domain:<32}  {action}{rule}")
+
+
 def cmd_reload(args, client):
     r = client.call("reload")
     print(f"reloaded {r['rules']} rules")
@@ -181,6 +324,42 @@ def build_parser():
     c.add_argument("domain")
     c.set_defaults(fn=cmd_check)
 
+    fw = sub.add_parser("firewall", help="manage the nftables firewall layer")
+    fw.add_argument("action", choices=["enable", "disable", "status"])
+    fw.set_defaults(fn=cmd_firewall)
+
+    cat = sub.add_parser("categories", help="manage blocklist categories")
+    cat_sub = cat.add_subparsers(dest="action", required=True)
+
+    cat_sub.add_parser("list").set_defaults(fn=cmd_categories)
+
+    ce = cat_sub.add_parser("enable")
+    ce.add_argument("name")
+    ce.set_defaults(fn=cmd_categories)
+
+    cd = cat_sub.add_parser("disable")
+    cd.add_argument("name")
+    cd.set_defaults(fn=cmd_categories)
+
+    u = sub.add_parser("update", help="fetch and apply blocklist updates")
+    u.add_argument("--categories", help="comma-separated list (default: all)")
+    u.set_defaults(fn=cmd_update)
+
+    lg = sub.add_parser("logs", help="show recent query log entries")
+    lg.add_argument(
+        "--tail", type=int, default=50, help="max entries to show (default 50)"
+    )
+    lg.add_argument("--domain", help="filter by domain or subdomain")
+    lg.add_argument("--since", help="duration like 30m, 2h, 1d")
+    lg.add_argument(
+        "--action",
+        choices=["allow", "block", "redirect", "servfail"],
+        help="filter by action",
+    )
+    lg.set_defaults(fn=cmd_logs)
+
+    sub.add_parser("flush-cache").set_defaults(fn=cmd_flush_cache)
+    sub.add_parser("status").set_defaults(fn=cmd_status)
     sub.add_parser("list").set_defaults(fn=cmd_list)
     sub.add_parser("ping").set_defaults(fn=cmd_ping)
     sub.add_parser("reload").set_defaults(fn=cmd_reload)
@@ -188,8 +367,10 @@ def build_parser():
     return p
 
 
-def main():
-    args = build_parser().parse_args()
+def main(argv=None):
+    check_root("warpperctl")
+
+    args = build_parser().parse_args(argv)
     client = ControlClient()
     try:
         args.fn(args, client)

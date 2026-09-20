@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-"""warpperd — DNS filter daemon."""
 
+import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
+import time
 from pathlib import Path
 
 from modules.cert import generate_ca
-from modules.config import get_db_path, load_config
+from modules.config import ensure_config, write_default_config
 from modules.control import ControlHandlers
 from modules.database import init_db
 from modules.dns_proxy import DNSProxy
+from modules.firewall import Firewall, FirewallError
 from modules.ipc import ControlServer, socket_path
 from modules.logger import QueryLogger
 from modules.rule_engine import RuleEngine
+
+started_at = time.time()
 
 
 def setup_logging(level: str) -> None:
@@ -24,8 +29,32 @@ def setup_logging(level: str) -> None:
     )
 
 
+def check_root(program: str) -> None:
+    if os.geteuid() != 0:
+        print(f"{program} must be run as root", file=sys.stderr)
+        raise SystemExit(1)
+
+
+def _build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="warpperd",
+        description="Warpper daemon",
+    )
+    sub = p.add_subparsers(dest="cmd")
+
+    i = sub.add_parser("init", help="write a default config file and exit")
+    i.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite an existing config file",
+    )
+
+    sub.add_parser("run", help="run the daemon (default)")
+
+    return p
+
+
 def parse_upstreams(raw: str) -> list[tuple[str, int]]:
-    """'1.1.1.1,8.8.8.8:5353' -> [('1.1.1.1', 53), ('8.8.8.8', 5353)]"""
     out = []
     for entry in raw.split(","):
         entry = entry.strip()
@@ -42,7 +71,6 @@ def parse_upstreams(raw: str) -> list[tuple[str, int]]:
 
 
 def ensure_ca(ca_dir: str) -> None:
-    """Only generate the CA if it's missing — regenerating breaks trust."""
     path = Path(ca_dir) / "ca.pem"
     if path.exists():
         logging.getLogger("dnsproxy").info(f"CA present at {path}")
@@ -51,27 +79,30 @@ def ensure_ca(ca_dir: str) -> None:
     generate_ca(ca_dir)
 
 
-def make_firewall_hook(firewall):
-    """Returns a callback for DNSProxy.on_resolve, or None if firewall is off."""
-    if firewall is None:
-        return None
+def main(argv=None) -> int:
+    check_root("warpperd")
 
-    def hook(client_ip: str, qname: str, ips: list[str]) -> None:
-        # Firewall decides what to do with the resolved IPs. The proxy
-        # only tells it *what* was resolved, not what to allow/block.
-        firewall.observe(client_ip, qname, ips)
+    args = _build_argparser().parse_args(argv)
 
-    return hook
+    if args.cmd == "init":
+        try:
+            written = write_default_config(overwrite=args.force)
+        except FileExistsError as e:
+            print(f"refusing: {e}", file=sys.stderr)
+            return 1
+        print(f"wrote {written}")
+        return 0
+
+    return asyncio.run(_run_daemon())
 
 
-async def main() -> int:
-    config = load_config()
-    setup_logging(config.get("general", "log_level", fallback="info"))
+async def _run_daemon() -> int:
+    config = ensure_config("warpperd")
     log = logging.getLogger("warpperd")
+    setup_logging(config.get("general", "log_level", fallback="info"))
 
-    db_path = get_db_path(config)
+    db_path = config.get("general", "db_path", fallback="/var/lib/warpper/warpper.db")
     init_db(db_path)
-
     ensure_ca(config.get("proxy", "ca_cert_path", fallback="certs"))
 
     upstreams = parse_upstreams(
@@ -85,19 +116,22 @@ async def main() -> int:
     rule_engine = RuleEngine(db_path)
     rule_engine.reload_rules()
 
-    # --- firewall (optional) ---
-    firewall = None
+    firewall = Firewall(
+        nft_family=config.get("firewall", "nft_family", fallback="inet"),
+        nft_table=config.get("firewall", "nft_table", fallback="warpper"),
+        block_set=config.get("firewall", "block_set", fallback="blocked_ips"),
+        port=config.getint("proxy", "listen_port", fallback=5353),
+        daemon_uid=os.getuid(),
+        logger=logger,
+    )
+    firewall_applied = False
     if config.getboolean("general", "enable_firewall", fallback=False):
-        from modules.firewall import Firewall
+        try:
+            firewall.apply()
+            firewall_applied = True
+        except (OSError, FirewallError) as e:
+            logger.error(f"failed to enable firewall: {e}")
 
-        firewall = Firewall(
-            nft_table=config.get("firewall", "nft_table", fallback="inet warpper"),
-            block_set=config.get("firewall", "block_set", fallback="blocked_ips"),
-            logger=logger,
-        )
-        firewall.apply()
-
-    # --- DNS proxy ---
     dns_proxy = DNSProxy(
         rule_engine=rule_engine,
         logger=logger,
@@ -105,11 +139,13 @@ async def main() -> int:
         sinkhole=config.get("general", "sinkhole_ip", fallback="0.0.0.0"),
         host=config.get("proxy", "listen_host", fallback="127.0.0.1"),
         port=config.getint("proxy", "listen_port", fallback=5353),
-        on_resolve=make_firewall_hook(firewall),
+        cache_max_size=config.getint("proxy", "cache_size", fallback=4096),
+        cache_max_ttl=config.getint("proxy", "cache_max_ttl", fallback=300),
     )
 
-    # --- IPC control socket ---
-    control = ControlHandlers(db_path, rule_engine, logger)
+    control = ControlHandlers(
+        db_path, rule_engine, firewall, logger, dns_proxy, config, started_at
+    )
     server = ControlServer(
         path=socket_path(),
         handlers={
@@ -121,24 +157,36 @@ async def main() -> int:
             "unblock": control.unblock,
             "whitelist": control.whitelist,
             "unwhitelist": control.unwhitelist,
+            "firewall_status": control.firewall_status,
+            "firewall_enable": control.firewall_enable,
+            "firewall_disable": control.firewall_disable,
+            "categories_list": control.categories_list,
+            "categories_enable": control.categories_enable,
+            "categories_disable": control.categories_disable,
+            "update": control.update,
+            "status": control.status,
+            "flush_cache": control.flush_cache,
+            "logs": control.logs,
             "reload": control.reload,
         },
         logger=logging.getLogger("ipc"),
-        group="warpper",
     )
 
-    # --- signal handling BEFORE anything that can block ---
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop_event.set)
 
-    # --- start everything ---
     exit_code = 0
     try:
         await server.start()
     except Exception:
         log.exception("failed to start control socket")
+        if firewall_applied:
+            try:
+                firewall.remove()
+            except Exception:
+                log.exception("error removing firewall rules")
         return 1
 
     try:
@@ -146,18 +194,21 @@ async def main() -> int:
     except Exception:
         log.exception("failed to start DNS proxy")
         await server.stop()
+        if firewall_applied:
+            try:
+                firewall.remove()
+            except Exception:
+                log.exception("error removing firewall rules")
         return 1
 
     log.info("warpperd started")
 
-    # --- wait for shutdown ---
     try:
         await stop_event.wait()
     except asyncio.CancelledError:
         pass
     log.info("shutting down")
 
-    # --- teardown, in reverse order ---
     try:
         await dns_proxy.close()
     except Exception:
@@ -170,7 +221,7 @@ async def main() -> int:
         log.exception("error closing control socket")
         exit_code = 1
 
-    if firewall is not None:
+    if firewall_applied:
         try:
             firewall.remove()
         except Exception:
@@ -181,19 +232,12 @@ async def main() -> int:
 
 
 def cli() -> None:
-    """Sync entry point for the `warpperd` console script."""
     try:
-        sys.exit(asyncio.run(main()))
+        rc = main()
     except KeyboardInterrupt:
-        sys.exit(130)
-
-
-def _run() -> None:
-    try:
-        sys.exit(asyncio.run(main()))
-    except KeyboardInterrupt:
-        sys.exit(130)
+        rc = 130
+    sys.exit(rc)
 
 
 if __name__ == "__main__":
-    _run()
+    cli()

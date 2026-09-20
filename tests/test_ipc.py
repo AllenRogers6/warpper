@@ -1,7 +1,5 @@
 import json
 
-import pytest
-
 from modules.ipc import PROTOCOL_VERSION
 
 

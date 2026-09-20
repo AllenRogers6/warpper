@@ -12,11 +12,7 @@ DEFAULT_SOCKET = "/run/warpperd.sock"
 def socket_path() -> Path:
     if env := os.environ.get("WARPPERD_SOCKET"):
         return Path(env)
-    if os.geteuid() == 0:
-        return Path(DEFAULT_SOCKET)
-    if xdg := os.environ.get("XDG_RUNTIME_DIR"):
-        return Path(xdg) / "warpperd.sock"
-    return Path(f"/tmp/warpperd-{os.getuid()}.sock")
+    return Path("/run/warpperd.sock")
 
 
 class ControlError(Exception):
@@ -29,12 +25,10 @@ class ControlServer:
         path: Path,
         handlers: dict,
         logger,
-        group: str | None = None,
     ):
         self.path = Path(path)
         self.handlers = handlers
         self.logger = logger
-        self.group = group
         self.server: asyncio.AbstractServer | None = None
 
     async def start(self):
@@ -50,18 +44,7 @@ class ControlServer:
             path=str(self.path),
         )
 
-        os.chmod(self.path, 0o660)
-        if self.group:
-            import grp
-
-            try:
-                gid = grp.getgrnam(self.group).gr_gid
-                os.chown(self.path, -1, gid)
-            except KeyError:
-                self.logger.warning(
-                    f"group {self.group!r} does not exist; " f"socket is owner-only"
-                )
-                os.chmod(self.path, 0o600)
+        os.chmod(self.path, 0o600)
 
         self.logger.info(f"control socket listening on {self.path}")
 
@@ -73,7 +56,7 @@ class ControlServer:
         try:
             self.path.unlink()
         except FileNotFoundError:
-            self.logger.warning(f"cannot remove stale socket {self.path}")
+            pass
 
     async def _handle_client(self, reader, writer):
         peer_pid = None
@@ -157,10 +140,10 @@ class ControlClient:
         self.path = path or socket_path()
         self.timeout = timeout
 
-    def call(self, cmd: str, **args):
+    def call(self, cmd: str, timeout: float | None = None, **args):
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(self.timeout)
+            sock.settimeout(timeout if timeout is not None else self.timeout)
             sock.connect(str(self.path))
         except FileNotFoundError:
             raise ControlError(f"daemon not running (no socket at {self.path})")

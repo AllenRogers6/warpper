@@ -2,60 +2,213 @@ name: Release
 
 on:
   release:
-    types:
-      - published
+    types: [published]
 
 permissions:
   contents: read
 
 jobs:
-  build:
-    name: Build distribution
+  verify:
+    name: Verify
     runs-on: ubuntu-latest
-
+    outputs:
+      version: ${{ steps.version.outputs.value }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
+          python-version: "3.11"
+          cache: pip
 
-      - name: Install build tools
+      - name: Install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install build
+          python -m pip install -e ".[dev]"
 
-      - name: Build distribution
+      - name: Check tag matches pyproject version
+        id: version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
         run: |
-          python -m build
+          set -euo pipefail
+          tag="${TAG#v}"
+          pyver=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "tag:       $tag"
+          echo "pyproject: $pyver"
+          if [ "$tag" != "$pyver" ]; then
+            echo "::error::tag ($tag) does not match pyproject version ($pyver)"
+            exit 1
+          fi
+          echo "value=$tag" >> "$GITHUB_OUTPUT"
 
-      - name: Upload distribution
+      - name: Run tests
+        run: pytest tests/ -v
+
+  build:
+    name: Build
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build pyinstaller .
+          python -m pip install -e .
+
+      - name: Build wheel
+        run: python -m build --wheel
+
+      - name: Build standalone binaries
+        run: |
+          pyinstaller --onefile --name warpperd   warpperd.py
+          pyinstaller --onefile --name warpperctl cli/warpperctl.py
+
+      - name: Package binaries as tarball
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp dist/warpperd dist/warpperctl release/
+          chmod +x release/warpperd release/warpperctl
+          tar -czf "release/warpper-${VERSION}-linux-x86_64.tar.gz" \
+            -C release warpperd warpperctl
+
+      - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
-          name: python-package-distributions
+          name: wheel
+          path: dist/*.whl
+          if-no-files-found: error
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarball
+          path: release/*.tar.gz
+          if-no-files-found: error
+
+  github-release:
+    name: Attach assets
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel
           path: dist/
 
-  publish:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarball
+          path: release/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.whl
+            release/*.tar.gz
+
+  pypi:
     name: Publish to PyPI
-    needs:
-      - build
-
+    needs: build
     runs-on: ubuntu-latest
-
     environment:
       name: pypi
-
+      url: https://pypi.org/p/warpper
     permissions:
       id-token: write
-
     steps:
-      - name: Download distribution
-        uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v4
         with:
-          name: python-package-distributions
+          name: wheel
           path: dist/
 
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  aur:
+    name: Publish to AUR
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ssh client
+        run: sudo apt-get update && sudo apt-get install -y openssh-client
+
+      - name: Set up SSH
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          AUR_KNOWN_HOSTS: ${{ secrets.AUR_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          printf '%s\n' "$AUR_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Compute source tarball hash
+        id: hash
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/${REPO}/archive/${TAG}.tar.gz"
+          curl -sL "$url" -o /tmp/src.tar.gz
+          sha=$(sha256sum /tmp/src.tar.gz | cut -d' ' -f1)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Update PKGBUILD
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.hash.outputs.sha }}
+        run: |
+          set -euo pipefail
+          pkgver="${TAG#v}"
+          sed -i "s/^pkgver=.*/pkgver=$pkgver/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          sed -i "s|^source=.*|source=(\"\$pkgname-\$pkgver.tar.gz::https://github.com/${REPO}/archive/${TAG}.tar.gz\")|" PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('${SHA}')/" PKGBUILD
+          grep -E '^(pkgver|pkgrel|source|sha256sums)=' PKGBUILD
+
+      - name: Generate .SRCINFO
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w archlinux:latest \
+            bash -c "pacman -Sy --noconfirm base-devel && \
+                     useradd -m builder && \
+                     chown -R builder /w && \
+                     su builder -c 'makepkg --printsrcinfo' > .SRCINFO"
+          cat .SRCINFO
+
+      - name: Push to AUR
+        env:
+          AUR_USER: ${{ secrets.AUR_USER }}
+        run: |
+          set -euo pipefail
+          git config --global user.name  "warpper CI"
+          git config --global user.email "ci@warpper.local"
+          git config --global core.sshCommand "ssh -i ~/.ssh/aur -o UserKnownHostsFile=~/.ssh/known_hosts"
+
+          git clone "ssh://${AUR_USER}@aur.archlinux.org/warpper.git" /tmp/aur
+          cp PKGBUILD .SRCINFO /tmp/aur/
+          cd /tmp/aur
+
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "AUR already at this version, nothing to push"
+            exit 0
+          fi
+          git commit -m "Update to ${GITHUB_REF_NAME#v}"
+          git push

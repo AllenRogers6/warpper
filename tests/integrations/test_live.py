@@ -1,11 +1,14 @@
 import subprocess
-import time
+
 import pytest
 
 
 def _nft_ok():
     return (
-        subprocess.run(["nft", "list", "tables"], capture_output=True).returncode == 0
+        subprocess.run(
+            ["nft", "list", "tables"], capture_output=True, check=False
+        ).returncode
+        == 0
     )
 
 
@@ -26,6 +29,7 @@ def test_firewall_apply_and_cleanup():
             ["nft", "list", "table", "inet", "warpper_test"],
             capture_output=True,
             text=True,
+            check=False,
         )
         assert r.returncode == 0
         assert "test_blocks" in r.stdout
@@ -36,10 +40,12 @@ def test_firewall_apply_and_cleanup():
 
 def test_dns_proxy_binds_and_responds():
     import asyncio
+
     from dnslib import DNSRecord
+
     from modules.database import init_db
-    from modules.rule_engine import RuleEngine
     from modules.dns_proxy import DNSProxy
+    from modules.rule_engine import RuleEngine
 
     async def scenario():
         db = "/tmp/warpper_test.db"

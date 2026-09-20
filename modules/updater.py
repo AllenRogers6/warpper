@@ -4,15 +4,15 @@ import urllib.request
 
 from modules.database import get_connection
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger("updater")
 
 BLOCKLIST_URLS = {
     "ads": [
         "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
-        "https://adaway.org/hosts.txt",
     ],
     "malware": [
-        "https://mirror1.malwaredomains.com/files/justdomains",
+        "https://urlhaus.abuse.ch/downloads/hostfile/",
+        "https://phishing.army/download/phishing_army_blocklist_extended.txt",
     ],
     "trackers": [
         "https://raw.githubusercontent.com/notracking/hosts-blocklists/master/hostnames.txt",
@@ -23,7 +23,7 @@ BLOCKLIST_URLS = {
 }
 
 
-def download_blocklist(url):
+def download_blocklist(url: str):
     try:
         with urllib.request.urlopen(url, timeout=30) as response:
             for line in response:
@@ -31,41 +31,59 @@ def download_blocklist(url):
                 if not line or line.startswith("#"):
                     continue
                 parts = line.split()
-                if len(parts) >= 2:
-                    domain = parts[1]
-                else:
-                    domain = parts[0]
+                domain = parts[1] if len(parts) >= 2 else parts[0]
                 domain = domain.strip()
                 if domain and not domain.startswith("#"):
                     yield domain
     except (urllib.error.URLError, TimeoutError, OSError) as e:
-        logger.error(f"Failed to download {url}: {e}")
+        log.error("failed to download %s: %s", url, e)
 
 
-def update_blocklists(db_path):
+def update_blocklists(db_path: str, categories: list[str] | None = None) -> dict:
+    if categories is None:
+        categories = list(BLOCKLIST_URLS.keys())
+
     conn = get_connection(db_path)
-    for category in BLOCKLIST_URLS:
-        cat_id = conn.execute(
-            "SELECT id FROM categories WHERE name=?", (category,)
-        ).fetchone()
-        if cat_id:
-            conn.execute("DELETE FROM rules WHERE category_id=?", (cat_id[0],))
-    for category, urls in BLOCKLIST_URLS.items():
-        cat_id = conn.execute(
-            "SELECT id FROM categories WHERE name=?", (category,)
-        ).fetchone()
-        if not cat_id:
-            cat_id = conn.execute(
-                "INSERT INTO categories (name) VALUES (?)", (category,)
-            ).lastrowid
-        else:
-            cat_id = cat_id[0]
-        for url in urls:
-            for domain in download_blocklist(url):
-                conn.execute(
-                    "INSERT INTO rules (pattern, type, category_id, action, enabled) VALUES (?,?,?,?,?)",
-                    (domain, "exact", cat_id, "block", 1),
+    summary = {}
+    try:
+        conn.execute("BEGIN")
+        for category in categories:
+            urls = BLOCKLIST_URLS.get(category)
+            if urls is None:
+                log.warning("unknown category: %s", category)
+                continue
+
+            row = conn.execute(
+                "SELECT id FROM categories WHERE name=?", (category,)
+            ).fetchone()
+            if row:
+                cat_id = row[0]
+                conn.execute("DELETE FROM rules WHERE category_id=?", (cat_id,))
+            else:
+                cur = conn.execute(
+                    "INSERT INTO categories (name) VALUES (?)", (category,)
                 )
-    conn.commit()
-    conn.close()
-    logger.info("Blocklists updated.")
+                cat_id = cur.lastrowid
+
+            count = 0
+            for url in urls:
+                for domain in download_blocklist(url):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO rules "
+                        "(pattern, type, category_id, action, enabled) "
+                        "VALUES (?, 'exact', ?, 'block', 1)",
+                        (domain, cat_id),
+                    )
+                    count += 1
+
+            summary[category] = count
+            log.info("updated %s: %d domains", category, count)
+
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+    return summary
