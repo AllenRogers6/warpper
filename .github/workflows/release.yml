@@ -24,7 +24,8 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
+          python -m pip install -e ".[dev]" || python -m pip install -e .
+          python -m pip install pytest pytest-asyncio
 
       - name: Check tag matches pyproject version
         id: version
@@ -43,7 +44,7 @@ jobs:
           echo "value=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Run tests
-        run: pytest tests/ -v
+        run: python -m pytest tests/ -v
 
   build:
     name: Build
@@ -117,98 +118,3 @@ jobs:
           files: |
             dist/*.whl
             release/*.tar.gz
-
-  pypi:
-    name: Publish to PyPI
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/warpper
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: wheel
-          path: dist/
-
-      - uses: pypa/gh-action-pypi-publish@release/v1
-
-  aur:
-    name: Publish to AUR
-    needs: verify
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install ssh client
-        run: sudo apt-get update && sudo apt-get install -y openssh-client
-
-      - name: Set up SSH
-        env:
-          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-          AUR_KNOWN_HOSTS: ${{ secrets.AUR_KNOWN_HOSTS }}
-        run: |
-          set -euo pipefail
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
-          chmod 600 ~/.ssh/aur
-          printf '%s\n' "$AUR_KNOWN_HOSTS" > ~/.ssh/known_hosts
-
-      - name: Compute source tarball hash
-        id: hash
-        env:
-          TAG: ${{ github.event.release.tag_name }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          url="https://github.com/${REPO}/archive/${TAG}.tar.gz"
-          curl -sL "$url" -o /tmp/src.tar.gz
-          sha=$(sha256sum /tmp/src.tar.gz | cut -d' ' -f1)
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-
-      - name: Update PKGBUILD
-        env:
-          TAG: ${{ github.event.release.tag_name }}
-          REPO: ${{ github.repository }}
-          SHA: ${{ steps.hash.outputs.sha }}
-        run: |
-          set -euo pipefail
-          pkgver="${TAG#v}"
-          sed -i "s/^pkgver=.*/pkgver=$pkgver/" PKGBUILD
-          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
-          sed -i "s|^source=.*|source=(\"\$pkgname-\$pkgver.tar.gz::https://github.com/${REPO}/archive/${TAG}.tar.gz\")|" PKGBUILD
-          sed -i "s/^sha256sums=.*/sha256sums=('${SHA}')/" PKGBUILD
-          grep -E '^(pkgver|pkgrel|source|sha256sums)=' PKGBUILD
-
-      - name: Generate .SRCINFO
-        run: |
-          docker run --rm -v "$PWD:/w" -w /w archlinux:latest \
-            bash -c "pacman -Sy --noconfirm base-devel && \
-                     useradd -m builder && \
-                     chown -R builder /w && \
-                     su builder -c 'makepkg --printsrcinfo' > .SRCINFO"
-          cat .SRCINFO
-
-      - name: Push to AUR
-        env:
-          AUR_USER: ${{ secrets.AUR_USER }}
-        run: |
-          set -euo pipefail
-          git config --global user.name  "warpper CI"
-          git config --global user.email "ci@warpper.local"
-          git config --global core.sshCommand "ssh -i ~/.ssh/aur -o UserKnownHostsFile=~/.ssh/known_hosts"
-
-          git clone "ssh://${AUR_USER}@aur.archlinux.org/warpper.git" /tmp/aur
-          cp PKGBUILD .SRCINFO /tmp/aur/
-          cd /tmp/aur
-
-          git add PKGBUILD .SRCINFO
-          if git diff --cached --quiet; then
-            echo "AUR already at this version, nothing to push"
-            exit 0
-          fi
-          git commit -m "Update to ${GITHUB_REF_NAME#v}"
-          git push
