@@ -31,7 +31,6 @@ if echo "$files" | grep -qE '\.INSTALL$'; then
 fi
 ok "no .INSTALL scriptlet"
 
-# The unit must NOT contain ExecStartPre=/usr/bin/warpperd init (removed)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 bsdtar -xf "$pkg" -C "$tmp" 'usr/lib/systemd/system/warpperd.service'
@@ -40,7 +39,6 @@ if grep -q 'ExecStartPre' "$tmp/usr/lib/systemd/system/warpperd.service"; then
 fi
 ok "no ExecStartPre in unit"
 
-# Config must be parseable and non-empty
 bsdtar -xf "$pkg" -C "$tmp" 'etc/warpper/warpper.conf'
 python - "$tmp/etc/warpper/warpper.conf" <<'PY'
 import configparser, sys
