@@ -19,11 +19,6 @@ resolver and enforces at the IP layer with nftables.
 
 ## Install
 
-**Arch (AUR):**
-
-    yay -S warpper
-    sudo systemctl enable --now warpperd
-
 **pip:**
 
     pip install warpper
